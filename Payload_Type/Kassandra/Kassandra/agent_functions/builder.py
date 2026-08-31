@@ -445,6 +445,14 @@ class KassandraAgent(PayloadType):
         # pattern). Only the kassandra crate recompiles per payload (~15s vs ~10min).
         cache_dir = "/opt/kassandra_cache"
 
+        # Clear stale kassandra crate fingerprints so config.rs changes take effect.
+        import glob
+        for pat in ["kassandra-*", "libkassandra-*"]:
+            for f in glob.glob(f"{cache_dir}/x86_64-pc-windows-gnu/release/.fingerprint/{pat}"):
+                shutil.rmtree(f, ignore_errors=True)
+            for f in glob.glob(f"{cache_dir}/x86_64-pc-windows-gnu/release/deps/{pat}"):
+                os.remove(f) if os.path.isfile(f) else shutil.rmtree(f, ignore_errors=True)
+
         # --- cargo build ---
         features = []
         if use_tailscale:
