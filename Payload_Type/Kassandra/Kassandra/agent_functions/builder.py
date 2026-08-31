@@ -28,21 +28,11 @@ class KassandraAgent(PayloadType):
     wrapped_payloads = []
     note = """Windows implant in Rust with EDR evasion, indirect syscalls, and OPSEC-safe defaults"""
     supports_dynamic_loading = False
-    c2_profiles = ["http", "httpx", "jwt_c2", "s3_storage", "tailscale"]
+    c2_profiles = ["http", "jwt_c2"]
     # Donut shellcode format / AMSI bypass choices (same ordering as Apollo / donut -f / -b).
     shellcode_format_options = ["Binary", "Base64", "C", "Ruby", "Python", "Powershell", "C#", "Hex"]
     shellcode_bypass_options = ["None", "Abort on fail", "Continue on fail"]
-    c2_parameter_deviations = {
-        "s3_storage": {
-            "encrypted_exchange_check": C2ParameterDeviation(supported=False),
-        },
-        "tailscale": {
-            "encrypted_exchange_check": C2ParameterDeviation(supported=False),
-        },
-        "httpx": {
-            "encrypted_exchange_check": C2ParameterDeviation(supported=False),
-        }
-    }
+    c2_parameter_deviations = {}
     mythic_encrypts = False
     translation_container = "KassandraTranslator"
     build_parameters = [
@@ -90,26 +80,6 @@ class KassandraAgent(PayloadType):
             parameter_type=BuildParameterType.String,
             description="Chunk size in bytes for upload/download",
             default_value="4096"
-        ),
-        BuildParameter(
-            name="tailscale_protocol",
-            parameter_type=BuildParameterType.ChooseOne,
-            choices=["http", "tcp"],
-            default_value="http",
-            description="Agent-to-C2 transport inside the WireGuard tunnel: http (compatible) or tcp (lower overhead)",
-        ),
-        BuildParameter(
-            name="doh",
-            parameter_type=BuildParameterType.ChooseOne,
-            choices=["off", "cloudflare", "google", "custom"],
-            default_value="off",
-            description="DNS-over-HTTPS: resolve Tailscale hostnames via DoH to avoid DNS logs",
-        ),
-        BuildParameter(
-            name="doh_url",
-            parameter_type=BuildParameterType.String,
-            default_value="",
-            description="Custom DoH resolver URL (only used when doh=custom, e.g. https://dns.example.com/dns-query)",
         ),
         BuildParameter(
             name="no_console",
