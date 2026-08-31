@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  lint-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install mythic-container
+      - name: Syntax-check agent_functions
+        run: python -m py_compile Payload_Type/Kassandra/Kassandra/agent_functions/builder.py
+      - name: Syntax-check all command definitions
+        run: |
+          for f in Payload_Type/Kassandra/Kassandra/agent_functions/*.py; do
+            python -m py_compile "$f"
+          done
+
+  check-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-04-30
+          targets: x86_64-pc-windows-gnu
+      - name: Stamp config.rs placeholders for CI
+        working-directory: Payload_Type/Kassandra/Kassandra/agent_code/kassandra
+        run: |
+          sed -i \
+            -e 's/%UUID%/CI-CHECK/g' \
+            -e 's/%HOSTNAME%/127.0.0.1/g' \
+            -e 's/%ENDPOINT%/post/g' \
+            -e 's/%PORT%/443/g' \
+            -e 's/%USERAGENT%/Mozilla/g' \
+            -e 's/%PROXYURL%//g' \
+            -e 's/%CHUNKSIZE%/4096/g' \
+            -e 's/%BUSYWORK_INTENSITY%/off/g' \
+            -e 's/%MAX_LOADED_DLLS%/5/g' \
+            -e 's/%NTP_SANDBOX_CHECK%/false/g' \
+            -e 's/%NTP_SERVER%/pool.ntp.org/g' \
+            -e 's/%CALLBACK_INTERVAL%/60/g' \
+            -e 's/%CALLBACK_JITTER%/10/g' \
+            -e 's/%USE_S3%/false/g' \
+            -e 's/%S3_ENDPOINT%//g' \
+            -e 's/%S3_BUCKET%//g' \
+            -e 's/%S3_REGION%/us-east-1/g' \
+            -e 's/%S3_PAYLOAD_PREFIX%//g' \
+            -e 's/%S3_BOOTSTRAP_ACCESS_KEY_ID%//g' \
+            -e 's/%S3_BOOTSTRAP_SECRET_ACCESS_KEY%//g' \
+            -e 's/%USE_TAILSCALE%/false/g' \
+            -e 's/%TS_AUTH_KEY%//g' \
+            -e 's/%TS_CONTROL_URL%//g' \
+            -e 's/%TS_SERVER_HOSTNAME%//g' \
+            -e 's/%TS_SERVER_PORT%/443/g' \
+            -e 's/%TS_PROTOCOL%/http/g' \
+            -e 's/%TS_TCP_PORT%/8080/g' \
+            -e 's/%TS_DOH_URL%//g' \
+            -e 's/%AESPSK%//g' \
+            src/config.rs
+      - name: Cargo check (default features)
+        working-directory: Payload_Type/Kassandra/Kassandra/agent_code/kassandra
+        run: cargo +nightly-2025-04-30 check --target x86_64-pc-windows-gnu
+      - name: Cargo check (no_console + debug_log)
+        working-directory: Payload_Type/Kassandra/Kassandra/agent_code/kassandra
+        run: cargo +nightly-2025-04-30 check --target x86_64-pc-windows-gnu --features no_console,debug_log
+
+  docker-build-push:
+    runs-on: ubuntu-latest
+    needs: [lint-python, check-rust]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: Payload_Type/Kassandra/
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+        timeout-minutes: 30
