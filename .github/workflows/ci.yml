@@ -71,6 +71,7 @@ jobs:
             -e 's/%TS_PROTOCOL%/http/g' \
             -e 's/%TS_TCP_PORT%/8080/g' \
             -e 's/%TS_DOH_URL%//g' \
+            -e 's/%USE_JWT_BEARER%/false/g' \
             -e 's/%AESPSK%//g' \
             src/config.rs
       - name: Cargo check (default features)
