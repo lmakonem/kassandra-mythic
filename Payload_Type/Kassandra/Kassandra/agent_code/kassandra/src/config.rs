@@ -11,9 +11,13 @@ pub static callback_port: &str = "%PORT%";
 pub static user_agent: &str = "%USERAGENT%";
 pub static proxy_host: &str = "%PROXYURL%";
 pub static chunk_size: usize = %CHUNKSIZE%;
-pub static use_ssl: bool = %SSL%;
-pub static use_proxy: bool = %PROXYENABLED%;
+pub static use_ssl : bool = false; // TODO: %SSL%
+pub static use_proxy: bool = false; // TODO: %PROXYENABLED%
 
+
+// JWT Bearer C2 configuration (stamped at build time)
+pub static use_jwt_bearer: bool = %USE_JWT_BEARER%;
+pub static jwt_secret: &str = "%JWT_SECRET%";
 pub static busywork_intensity: &str = "%BUSYWORK_INTENSITY%";
 
 pub static max_loaded_dlls: usize = %MAX_LOADED_DLLS%;
@@ -45,9 +49,6 @@ pub static ts_server_port: &str = "%TS_SERVER_PORT%";
 pub static ts_protocol: &str = "%TS_PROTOCOL%";
 pub static ts_tcp_port: &str = "%TS_TCP_PORT%";
 pub static ts_doh_url: &str = "%TS_DOH_URL%";
-
-// JWT Bearer transport mode (GET + Authorization header)
-pub static use_jwt_bearer: bool = %USE_JWT_BEARER%;
 
 // Pre-shared key for EKE (base64-encoded, empty if encryption disabled)
 pub static AESPSK: &str = "%AESPSK%";
