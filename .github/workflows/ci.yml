@@ -48,6 +48,8 @@ jobs:
             -e 's/%ENDPOINT%/post/g' \
             -e 's/%PORT%/443/g' \
             -e 's/%USERAGENT%/Mozilla/g' \
+            -e 's/%SSL%/false/g' \
+            -e 's/%PROXYENABLED%/false/g' \
             -e 's/%PROXYURL%//g' \
             -e 's/%CHUNKSIZE%/4096/g' \
             -e 's/%BUSYWORK_INTENSITY%/off/g' \

