@@ -22,7 +22,7 @@ from .pe_opsec import (
 class KassandraAgent(PayloadType):
     name = "Kassandra"
     file_extension = "exe"
-    author = "@TucoTaco"
+    author = "@nana-reader, @Tuco"
     supported_os = [SupportedOS.Windows]
     wrapper = False
     wrapped_payloads = []
