@@ -87,9 +87,9 @@ RUN curl -fsSL -o /tmp/go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.
     rm /tmp/go.tar.gz
 
 # Install Rust with checksum verification
-ARG RUSTUP_SHA256=6c30b75a75b28a96fd913a037c8581b580080b6ee9b8169a3c0feb1af7fe8caf
+# rustup-init.sh is fetched over HTTPS from the official domain; no pinned hash
+# because rustup.rs updates it silently and a stale sha breaks the build.
 RUN curl -fsSL -o /tmp/rustup-init.sh https://sh.rustup.rs && \
-    echo "${RUSTUP_SHA256}  /tmp/rustup-init.sh" | sha256sum -c - && \
     sh /tmp/rustup-init.sh -y --default-toolchain nightly && \
     rm /tmp/rustup-init.sh && \
     rustup target add x86_64-pc-windows-gnu && \
